@@ -1,0 +1,12 @@
+name: ZaiRenHangTian
+version: '1'
+main: top.zhrhello.zaiRenHangTian.ZaiRenHangTian
+api-version: '1.20'
+commands:
+  zrhb:
+    description: 宰人航天黑名单管理
+    usage: /zrhb <on|off>
+    permission: zrhb.command
+permissions:
+  zrhb.command:
+    default: true
