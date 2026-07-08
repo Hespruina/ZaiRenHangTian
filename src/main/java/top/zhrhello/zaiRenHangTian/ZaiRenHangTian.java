@@ -71,6 +71,9 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
         flightTriggerHeights.clear();
         inFlight.clear();
         flightPairs.clear();
+        
+        // 保证最后一次权限修改落盘
+        savePermissions();
     }
 
     // 启动全局烟花检测任务
@@ -261,13 +264,8 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
     // 天空检测
     private boolean isSkyClear(Player player) {
         Location loc = player.getLocation();
-        World world = player.getWorld();
-        for (int y = loc.getBlockY() + 1; y < world.getMaxHeight(); y++) {
-            if (world.getBlockAt(loc.getBlockX(), y, loc.getBlockZ()).getType() != Material.AIR) {
-                return false;
-            }
-        }
-        return true;
+        int highestY = player.getWorld().getHighestBlockYAt(loc.getBlockX(), loc.getBlockZ());
+        return highestY <= loc.getBlockY();
     }
 
     // 启动航班
@@ -307,10 +305,18 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
             player.removePotionEffect(PotionEffectType.LEVITATION);
         }
 
+        // 同时处理配对玩家，避免递归
         UUID pairUuid = flightPairs.remove(uuid);
         if (pairUuid != null) {
             flightPairs.remove(pairUuid);
-            endFlight(pairUuid);
+            if (inFlight.remove(pairUuid)) {
+                deactivateFireworkEffect(pairUuid);
+                flightTriggerHeights.remove(pairUuid);
+                Player pairPlayer = Bukkit.getPlayer(pairUuid);
+                if (pairPlayer != null && pairPlayer.isOnline()) {
+                    pairPlayer.removePotionEffect(PotionEffectType.LEVITATION);
+                }
+            }
         }
     }
 
@@ -384,7 +390,8 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
 
     private void setBlacklist(UUID uuid, boolean isBlacklisted) {
         blacklistMap.put(uuid, isBlacklisted);
-        savePermissions();
+        // 异步保存，避免阻塞主线程
+        Bukkit.getScheduler().runTaskAsynchronously(this, this::savePermissions);
     }
 
     // 事件监听
