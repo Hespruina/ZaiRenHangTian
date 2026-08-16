@@ -15,13 +15,16 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
-import org.bukkit.scheduler.BukkitRunnable;
-import org.bukkit.scheduler.BukkitTask;
+
+import com.cjcrafter.foliascheduler.FoliaCompatibility;
+import com.cjcrafter.foliascheduler.ServerImplementation;
+import com.cjcrafter.foliascheduler.TaskImplementation;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class ZaiRenHangTian extends JavaPlugin implements Listener {
     // 核心数据结构
@@ -30,8 +33,11 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
     private final Set<UUID> inFlight = ConcurrentHashMap.newKeySet();
     private final Set<UUID> fireworkEffectActive = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Double> flightTriggerHeights = new ConcurrentHashMap<>();
-    private final Map<UUID, BukkitTask> fireworkTasks = new ConcurrentHashMap<>();
-    private BukkitTask globalCheckerTask;
+    private final Map<UUID, TaskImplementation<Void>> fireworkTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, TaskImplementation<Void>> heightCheckTasks = new ConcurrentHashMap<>();
+
+    // Folia 兼容调度器（Bukkit/Paper 上回退为 Bukkit 调度器，Folia 上使用 Region/Entity 调度器）
+    private ServerImplementation scheduler;
 
     // 自定义物品
     private ItemStack getZR370Item() {
@@ -47,106 +53,104 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        scheduler = new FoliaCompatibility(this).getServerImplementation();
         saveDefaultConfig();
         loadPermissions();
         registerEvents();
         registerRecipe();
         registerCommand();
-        
-        // 启动全局烟花检测任务
-        startFireworkEffectChecker();
-        
+
         getLogger().info("宰人航天插件已启用！");
     }
 
     @Override
     public void onDisable() {
         // 清理所有任务
-        if (globalCheckerTask != null) {
-            globalCheckerTask.cancel();
-        }
-        fireworkTasks.values().forEach(BukkitTask::cancel);
+        heightCheckTasks.values().forEach(TaskImplementation::cancel);
+        heightCheckTasks.clear();
+        fireworkTasks.values().forEach(TaskImplementation::cancel);
         fireworkTasks.clear();
+        if (scheduler != null) {
+            scheduler.cancelTasks();
+        }
         fireworkEffectActive.clear();
         flightTriggerHeights.clear();
         inFlight.clear();
         flightPairs.clear();
-        
+
         // 保证最后一次权限修改落盘
         savePermissions();
     }
 
-    // 启动全局烟花检测任务
-    private void startFireworkEffectChecker() {
-        globalCheckerTask = new BukkitRunnable() {
-            @Override
-            public void run() {
-                for (UUID uuid : inFlight) {
-                    Player player = Bukkit.getPlayer(uuid);
-                    if (player == null || !player.isOnline()) continue;
-                    
-                    double currentY = player.getLocation().getY();
-                    double triggerHeight = flightTriggerHeights.getOrDefault(uuid, 0.0);
-                    
-                    // 检查是否达到触发高度
-                    if (currentY >= triggerHeight && !fireworkEffectActive.contains(uuid)) {
-                        activateFireworkEffect(uuid);
-                    }
-                    // 检查是否跌回触发高度以下
-                    else if (currentY < triggerHeight && fireworkEffectActive.contains(uuid)) {
-                        deactivateFireworkEffect(uuid);
-                    }
-                }
+    // 为单个玩家启动高度检测（在玩家所在线程执行，玩家离线自动停）
+    private void startHeightChecker(Player player) {
+        UUID uuid = player.getUniqueId();
+        TaskImplementation<Void> task = scheduler.entity(player).runAtFixedRate(t -> {
+            // 玩家离线或已结束航班则自停
+            if (!player.isOnline() || !inFlight.contains(uuid)) {
+                t.cancel();
+                heightCheckTasks.remove(uuid, t);
+                return;
             }
-        }.runTaskTimer(this, 0L, 5L);
+
+            double currentY = player.getLocation().getY();
+            double triggerHeight = flightTriggerHeights.getOrDefault(uuid, 0.0);
+
+            // 检查是否达到触发高度
+            if (currentY >= triggerHeight && !fireworkEffectActive.contains(uuid)) {
+                activateFireworkEffect(uuid);
+            }
+            // 检查是否跌回触发高度以下
+            else if (currentY < triggerHeight && fireworkEffectActive.contains(uuid)) {
+                deactivateFireworkEffect(uuid);
+            }
+        }, 1L, 5L);
+        heightCheckTasks.put(uuid, task);
     }
 
     // 激活烟花特效
     private void activateFireworkEffect(UUID uuid) {
-        fireworkEffectActive.add(uuid);
-        
-        BukkitTask task = new BukkitRunnable() {
-            @Override
-            public void run() {
-                Player player = Bukkit.getPlayer(uuid);
-                if (player == null || !player.isOnline()) {
-                    deactivateFireworkEffect(uuid);
-                    return;
-                }
-                
-                Location loc = player.getLocation();
-                World world = player.getWorld();
-                Random random = new Random();
-                
-                // 在主玩家位置生成烟花
-                spawnFireworkParticles(world, loc, random);
-                
-                // 在配对玩家的位置也生成烟花
-                UUID pairUUID = flightPairs.get(uuid);
-                if (pairUUID != null) {
-                    Player pairPlayer = Bukkit.getPlayer(pairUUID);
-                    if (pairPlayer != null && pairPlayer.isOnline()) {
-                        spawnFireworkParticles(world, pairPlayer.getLocation(), random);
-                    }
+        if (!fireworkEffectActive.add(uuid)) return;
+
+        Player player = Bukkit.getPlayer(uuid);
+        if (player == null || !player.isOnline()) {
+            fireworkEffectActive.remove(uuid);
+            return;
+        }
+
+        player.sendMessage(ChatColor.GOLD + "[宰人航天] 已到达太空！烟花庆祝！🎆");
+
+        TaskImplementation<Void> task = scheduler.entity(player).runAtFixedRate(t -> {
+            if (!player.isOnline()) {
+                deactivateFireworkEffect(uuid);
+                return;
+            }
+
+            // 在主玩家位置生成烟花
+            spawnFireworkParticles(player.getWorld(), player.getLocation());
+
+            // 在配对玩家的位置也生成烟花（调度到对方所在线程）
+            UUID pairUUID = flightPairs.get(uuid);
+            if (pairUUID != null) {
+                Player pairPlayer = Bukkit.getPlayer(pairUUID);
+                if (pairPlayer != null && pairPlayer.isOnline()) {
+                    Player pp = pairPlayer;
+                    scheduler.entity(pp).run(() -> spawnFireworkParticles(pp.getWorld(), pp.getLocation()));
                 }
             }
-        }.runTaskTimer(this, 0L, 2L);
-        
+        }, 1L, 2L);
+
         fireworkTasks.put(uuid, task);
-        
-        Player player = Bukkit.getPlayer(uuid);
-        if (player != null) {
-            player.sendMessage(ChatColor.GOLD + "[宰人航天] 已到达太空！烟花庆祝！🎆");
-        }
     }
 
-    // 生成烟花粒子
-    private void spawnFireworkParticles(World world, Location loc, Random random) {
+    // 生成烟花粒子（内部使用 ThreadLocalRandom，可安全地在任意线程调用）
+    private void spawnFireworkParticles(World world, Location loc) {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
         for (int i = 0; i < 20; i++) {
             double offsetX = (random.nextDouble() - 0.5) * 3;
             double offsetY = (random.nextDouble() - 0.5) * 3;
             double offsetZ = (random.nextDouble() - 0.5) * 3;
-            
+
             world.spawnParticle(
                 Particle.FIREWORKS_SPARK,
                 loc.clone().add(offsetX, offsetY, offsetZ),
@@ -154,22 +158,19 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
                 0.1, 0.1, 0.1,
                 0.02
             );
-            
+
             if (random.nextBoolean()) {
                 Color color = Color.fromRGB(
                     random.nextInt(256),
                     random.nextInt(256),
                     random.nextInt(256)
                 );
-                
+
                 world.spawnParticle(
                     Particle.SPELL_MOB,
                     loc.clone().add(offsetX, offsetY, offsetZ),
                     0,
-                    color.getRed() / 255.0,
-                    color.getGreen() / 255.0,
-                    color.getBlue() / 255.0,
-                    1.0
+                    color
                 );
             }
         }
@@ -178,12 +179,12 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
     // 取消烟花特效
     private void deactivateFireworkEffect(UUID uuid) {
         fireworkEffectActive.remove(uuid);
-        
-        BukkitTask task = fireworkTasks.remove(uuid);
+
+        TaskImplementation<Void> task = fireworkTasks.remove(uuid);
         if (task != null) {
             task.cancel();
         }
-        
+
         Player player = Bukkit.getPlayer(uuid);
         if (player != null) {
             player.sendMessage(ChatColor.RED + "[宰人航天] 你正在返回大气层...");
@@ -227,7 +228,7 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
         }
     }
 
-    // 实体交互监听
+    // 实体交互监听（事件在点击者所在线程触发，target 的实体操作会调度到 target 所在线程）
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onInteract(PlayerInteractEntityEvent event) {
         if (!(event.getRightClicked() instanceof Player target)) return;
@@ -244,61 +245,89 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
             return;
         }
 
-        if (!isSkyClear(player) || !isSkyClear(target)) {
+        // 玩家自身的天空检测（当前线程即玩家所在线程）
+        if (!isSkyClear(player)) {
             player.sendMessage(ChatColor.RED + "[宰人航天] 您当前所处并非旷野，不允许点火");
             event.setCancelled(true);
             return;
         }
 
-        startFlight(player, target);
-        
-        if (item.getAmount() > 1) {
-            item.setAmount(item.getAmount() - 1);
-        } else {
-            player.getInventory().setItemInMainHand(new ItemStack(Material.AIR));
-        }
-        
         event.setCancelled(true);
+
+        // target 的天空检测在 target 所在线程执行
+        scheduler.entity(target).run(() -> {
+            if (!isSkyClear(target)) {
+                player.sendMessage(ChatColor.RED + "[宰人航天] 您当前所处并非旷野，不允许点火");
+                return;
+            }
+            // 回到 player 所在线程消耗物品并启动航班
+            Player p = player;
+            scheduler.entity(p).run(() -> {
+                // 期间主手物品可能被更换，重新校验
+                ItemStack current = p.getInventory().getItemInMainHand();
+                if (!current.isSimilar(getZR370Item())) return;
+
+                if (current.getAmount() > 1) {
+                    current.setAmount(current.getAmount() - 1);
+                } else {
+                    p.getInventory().setItemInMainHand(new ItemStack(Material.AIR));
+                }
+
+                startFlight(p, target);
+            });
+        });
     }
 
-    // 天空检测
+    // 天空检测（必须在该玩家所在线程调用）
     private boolean isSkyClear(Player player) {
         Location loc = player.getLocation();
         int highestY = player.getWorld().getHighestBlockYAt(loc.getBlockX(), loc.getBlockZ());
         return highestY <= loc.getBlockY();
     }
 
-    // 启动航班
+    // 启动航班（必须在 player 所在线程调用；target 的实体操作自动调度到 target 所在线程）
     private void startFlight(Player player, Player target) {
         String msg = ChatColor.GREEN + "[宰人航天] 欢迎搭乘本公司载人航天VIP专线，本次航班无降落服务。";
-        player.sendMessage(msg);
-        target.sendMessage(msg);
 
         double triggerHeightPlayer = player.getLocation().getY() + 100;
-        double triggerHeightTarget = target.getLocation().getY() + 100;
-        
+
         inFlight.add(player.getUniqueId());
         inFlight.add(target.getUniqueId());
         flightPairs.put(player.getUniqueId(), target.getUniqueId());
         flightPairs.put(target.getUniqueId(), player.getUniqueId());
-        
+
         flightTriggerHeights.put(player.getUniqueId(), triggerHeightPlayer);
-        flightTriggerHeights.put(target.getUniqueId(), triggerHeightTarget);
+
+        player.sendMessage(msg);
+        player.sendMessage(ChatColor.YELLOW + "[宰人航天] 触发烟花高度: " + String.format("%.1f", triggerHeightPlayer));
 
         PotionEffect levitation = new PotionEffect(PotionEffectType.LEVITATION, 600, 254, false, false);
         player.addPotionEffect(levitation);
-        target.addPotionEffect(levitation);
-        
-        player.sendMessage(ChatColor.YELLOW + "[宰人航天] 触发烟花高度: " + String.format("%.1f", triggerHeightPlayer));
-        target.sendMessage(ChatColor.YELLOW + "[宰人航天] 触发烟花高度: " + String.format("%.1f", triggerHeightTarget));
+        startHeightChecker(player);
+
+        // target 的实体操作在其所在线程执行
+        Player t = target;
+        scheduler.entity(t).run(() -> {
+            double triggerHeightTarget = t.getLocation().getY() + 100;
+            flightTriggerHeights.put(t.getUniqueId(), triggerHeightTarget);
+
+            t.sendMessage(msg);
+            t.sendMessage(ChatColor.YELLOW + "[宰人航天] 触发烟花高度: " + String.format("%.1f", triggerHeightTarget));
+            t.addPotionEffect(new PotionEffect(PotionEffectType.LEVITATION, 600, 254, false, false));
+            startHeightChecker(t);
+        });
     }
 
-    // 结束航班
+    // 结束航班（被 onDeath/onQuit 调用，调用线程即该玩家所在线程；配对玩家的操作会调度到对方线程）
     private void endFlight(UUID uuid) {
         if (!inFlight.remove(uuid)) return;
 
         deactivateFireworkEffect(uuid);
         flightTriggerHeights.remove(uuid);
+        TaskImplementation<Void> heightTask = heightCheckTasks.remove(uuid);
+        if (heightTask != null) {
+            heightTask.cancel();
+        }
 
         Player player = Bukkit.getPlayer(uuid);
         if (player != null && player.isOnline()) {
@@ -312,9 +341,15 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
             if (inFlight.remove(pairUuid)) {
                 deactivateFireworkEffect(pairUuid);
                 flightTriggerHeights.remove(pairUuid);
+                TaskImplementation<Void> pairHeightTask = heightCheckTasks.remove(pairUuid);
+                if (pairHeightTask != null) {
+                    pairHeightTask.cancel();
+                }
+
                 Player pairPlayer = Bukkit.getPlayer(pairUuid);
                 if (pairPlayer != null && pairPlayer.isOnline()) {
-                    pairPlayer.removePotionEffect(PotionEffectType.LEVITATION);
+                    Player pp = pairPlayer;
+                    scheduler.entity(pp).run(() -> pp.removePotionEffect(PotionEffectType.LEVITATION));
                 }
             }
         }
@@ -390,8 +425,8 @@ public class ZaiRenHangTian extends JavaPlugin implements Listener {
 
     private void setBlacklist(UUID uuid, boolean isBlacklisted) {
         blacklistMap.put(uuid, isBlacklisted);
-        // 异步保存，避免阻塞主线程
-        Bukkit.getScheduler().runTaskAsynchronously(this, this::savePermissions);
+        // 异步保存，避免阻塞所在线程
+        scheduler.async().runNow(this::savePermissions);
     }
 
     // 事件监听
